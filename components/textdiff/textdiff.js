@@ -58,11 +58,12 @@ class WhiteSpace {
 
 class TextDiffViewModel {
   constructor(args) {
-    this.filename = args.filename;
-    this.oldFilename = args.oldFilename;
     this.repoPath = args.repoPath;
     this.server = args.server;
-    this.sha1 = args.sha1;
+    this.diffKey = args.diffKey;
+    this.idx = args.idx;
+    this.filename = args.filename;
+    this.oldFilename = args.oldFilename;
     this.hasMore = ko.observable(false);
     this.diffJson = null;
     this.loadCount = loadLimit;
@@ -96,11 +97,16 @@ class TextDiffViewModel {
   }
 
   getDiffArguments() {
+    if (this.diffKey)
+      return {
+        path: this.repoPath(),
+        diffKey: this.diffKey,
+        idx: this.idx,
+      };
     return {
-      file: this.filename,
-      oldFile: this.oldFilename,
+      file: this.filename || '',
+      oldFile: this.oldFilename || '',
       path: this.repoPath(),
-      sha1: this.sha1 ? this.sha1 : '',
       whiteSpace: this.whiteSpace.value(),
     };
   }
@@ -114,7 +120,7 @@ class TextDiffViewModel {
     return this.server
       .getPromise('/diff', this.getDiffArguments())
       .then((diffs) => {
-        if (typeof diffs !== 'string') {
+        if (!diffs || typeof diffs !== 'string') {
           // Invalid value means there is no changes, show dummy diff without any changes
           diffs = `diff --git a/${this.filename} b/${this.filename}
                   index aaaaaaaa..bbbbbbbb 111111

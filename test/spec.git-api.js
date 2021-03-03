@@ -54,7 +54,7 @@ describe('git-api', () => {
   it('quickstatus should say uninited in uninited directory', () => {
     return common
       .get(req, '/quickstatus', { path: testDir })
-      .then((res) => expect(res).to.eql({ type: 'uninited', gitRootPath: testDir }));
+      .catch((e) => expect(e.errorCode).to.be('no-such-path'));
   });
 
   it('status should fail in non-existing directory', () => {
@@ -106,7 +106,7 @@ describe('git-api', () => {
 
   it('head should be empty before first commit', () => {
     return common.get(req, '/head', { path: testDir }).then((res) => {
-      expect(res).to.be.a('array');
+      expect(res).to.be.false();
       expect(res.length).to.be(0);
     });
   });
@@ -138,8 +138,8 @@ describe('git-api', () => {
         conflict: false,
         renamed: false,
         type: 'text',
-        additions: '-',
-        deletions: '-',
+        additions: null,
+        deletions: null,
       });
     });
   });
@@ -176,11 +176,9 @@ describe('git-api', () => {
 
   it('head should show latest commit', () => {
     return common.get(req, '/head', { path: testDir }).then((res) => {
-      expect(res).to.be.a('array');
-      expect(res.length).to.be(1);
-      expect(res[0].message.indexOf(commitMessage)).to.be(0);
-      expect(res[0].authorName).to.be(gitConfig['user.name']);
-      expect(res[0].authorEmail).to.be(gitConfig['user.email']);
+      expect(res.message.indexOf(commitMessage)).to.be(0);
+      expect(res.authorName).to.be(gitConfig['user.name']);
+      expect(res.authorEmail).to.be(gitConfig['user.email']);
     });
   });
 
@@ -211,7 +209,7 @@ describe('git-api', () => {
     return common.post(req, '/discardchanges', { path: testDir, file: testFile });
   });
 
-  it('modifying a test file should work', () => {
+  it('modifying a test file should work part deux', () => {
     return common.post(req, '/testing/changefile', { file: path.join(testDir, testFile) });
   });
 
@@ -249,8 +247,8 @@ describe('git-api', () => {
         conflict: false,
         renamed: false,
         type: 'text',
-        additions: '-',
-        deletions: '-',
+        additions: null,
+        deletions: null,
       });
     });
   });
@@ -283,7 +281,7 @@ describe('git-api', () => {
     return common.post(req, '/testing/createfile', { file: path.join(testDir, testFile3) });
   });
 
-  it('status should list the new file', () => {
+  it('status should list the new file once again', () => {
     return common.get(req, '/status', { path: testDir }).then((res) => {
       expect(Object.keys(res.files).length).to.be(1);
       expect(res.files[testFile3]).to.eql({
@@ -296,8 +294,8 @@ describe('git-api', () => {
         conflict: false,
         renamed: false,
         type: 'text',
-        additions: '-',
-        deletions: '-',
+        additions: null,
+        deletions: null,
       });
     });
   });

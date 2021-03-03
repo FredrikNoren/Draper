@@ -1,12 +1,10 @@
 const ko = require('knockout');
 const _ = require('lodash');
-const moment = require('moment');
 const octicons = require('octicons');
 const components = require('ungit-components');
 const GitNodeViewModel = require('./git-node');
 const GitRefViewModel = require('./git-ref');
 const EdgeViewModel = require('./edge');
-const numberOfNodesPerLoad = ungit.config.numberOfNodesPerLoad;
 
 components.register('graph', (args) => new GraphViewModel(args.server, args.repoPath));
 
@@ -14,18 +12,20 @@ class GraphViewModel {
   constructor(server, repoPath) {
     this._markIdeologicalStamp = 0;
     this.repoPath = repoPath;
-    this.limit = ko.observable(numberOfNodesPerLoad);
     this.skip = ko.observable(0);
     this.server = server;
     this.currentRemote = ko.observable();
-    this.nodes = ko.observableArray();
-    this.edges = ko.observableArray();
-    this.refs = ko.observableArray();
-    this.nodesById = {};
-    this.refsByRefName = {};
+    this.nodes = ko.observableArray(/** @type {GraphNode[]} */ ([]));
+    this.missingNodes = /** @type {Set<GraphNode>} */ (new Set());
+    this.didFetch = false;
+    this.logNodes = [];
+    this.edges = ko.observableArray(/** @type {GraphEdge[]} */ ([]));
+    this.refs = ko.observableArray(/** @type {GraphRef[]} */ ([]));
+    this.nodesById = /** @type {Map<Hash, GraphNode>} */ (new Map());
+    this.refsByRefName = /** @type {Record<string, GraphRef>} */ ({});
     this.checkedOutBranch = ko.observable();
-    this.checkedOutRef = ko.computed(() =>
-      this.checkedOutBranch() ? this.getRef(`refs/heads/${this.checkedOutBranch()}`) : null
+    this.checkedOutRef = ko.computed(
+      () => this.checkedOutBranch() && this.refsByRefName[`refs/heads/${this.checkedOutBranch()}`]
     );
     this.HEADref = ko.observable();
     this.HEAD = ko.computed(() => (this.HEADref() ? this.HEADref().node() : undefined));
@@ -37,25 +37,7 @@ class GraphViewModel {
     this.showCommitNode = ko.observable(false);
     this.currentActionContext = ko.observable();
     this.edgesById = {};
-    this.scrolledToEnd = _.debounce(
-      () => {
-        this.limit(numberOfNodesPerLoad + this.limit());
-        this.loadNodesFromApi();
-      },
-      500,
-      true
-    );
-    this.loadAhead = _.debounce(
-      () => {
-        if (this.skip() <= 0) return;
-        this.skip(Math.max(this.skip() - numberOfNodesPerLoad, 0));
-        this.loadNodesFromApi();
-      },
-      500,
-      true
-    );
     this.commitOpacity = ko.observable(1.0);
-    this.heighstBranchOrder = 0;
     this.hoverGraphActionGraphic = ko.observable();
     this.hoverGraphActionGraphic.subscribe(
       (value) => {
@@ -74,14 +56,17 @@ class GraphViewModel {
       }
     });
 
-    this.loadNodesFromApiThrottled = _.throttle(this.loadNodesFromApi.bind(this), 1000);
-    this.updateBranchesThrottled = _.throttle(this.updateBranches.bind(this), 1000);
-    this.loadNodesFromApi();
+    this.loadNodesFromApiThrottled = _.throttle(this.fetchCommits.bind(this), 100);
+    this.updateBranchesThrottled = _.throttle(this.updateBranches.bind(this), 100);
+    this.scrolledToEnd = this.loadNodesFromApiThrottled;
+    this.loadAhead = this.loadNodesFromApiThrottled;
     this.updateBranches();
     this.graphWidth = ko.observable();
     this.graphHeight = ko.observable(800);
     this.searchIcon = octicons.search.toSVG({ height: 18 });
     this.plusIcon = octicons.plus.toSVG({ height: 18 });
+    // For debugging, remove later
+    console.log(this);
   }
 
   updateNode(parentElement) {
@@ -89,125 +74,301 @@ class GraphViewModel {
   }
 
   getNode(sha1, logEntry) {
-    let nodeViewModel = this.nodesById[sha1];
-    if (!nodeViewModel) nodeViewModel = this.nodesById[sha1] = new GitNodeViewModel(this, sha1);
+    let nodeViewModel = this.nodesById.get(sha1);
+    if (!nodeViewModel) {
+      nodeViewModel = new GitNodeViewModel(this, sha1);
+      this.nodesById.set(sha1, nodeViewModel);
+    }
     if (logEntry) nodeViewModel.setData(logEntry);
     return nodeViewModel;
   }
 
-  getRef(ref, constructIfUnavailable) {
-    if (constructIfUnavailable === undefined) constructIfUnavailable = true;
+  getRef(ref, sha1) {
     let refViewModel = this.refsByRefName[ref];
-    if (!refViewModel && constructIfUnavailable) {
-      refViewModel = this.refsByRefName[ref] = new GitRefViewModel(ref, this);
-      this.refs.push(refViewModel);
-      if (refViewModel.name === 'HEAD') {
-        this.HEADref(refViewModel);
+    if (sha1) {
+      if (refViewModel) {
+        if (refViewModel.sha1 !== sha1) refViewModel.setSha1(sha1);
+      } else {
+        refViewModel = this.refsByRefName[ref] = new GitRefViewModel(ref, this, sha1);
+        this.refs.push(refViewModel);
+        if (refViewModel.name === 'HEAD') {
+          this.HEADref(refViewModel);
+        }
       }
+    } else if (!refViewModel && sha1 !== false) {
+      throw new Error(`Unknown ref ${ref}`);
     }
     return refViewModel;
   }
 
-  loadNodesFromApi() {
-    const nodeSize = this.nodes().length;
-
-    return this.server
-      .getPromise('/gitlog', { path: this.repoPath(), limit: this.limit(), skip: this.skip() })
-      .then((log) => {
-        // set new limit and skip
-        this.limit(parseInt(log.limit));
-        this.skip(parseInt(log.skip));
-        return log.nodes || [];
-      })
-      .then((
-        nodes // create and/or calculate nodes
-      ) =>
-        this.computeNode(
-          nodes.map((logEntry) => {
-            return this.getNode(logEntry.sha1, logEntry); // convert to node object
-          })
-        )
-      )
-      .then((nodes) => {
-        // create edges
-        const edges = [];
-        nodes.forEach((node) => {
-          node.parents().forEach((parentSha1) => {
-            edges.push(this.getEdge(node.sha1, parentSha1));
-          });
-          node.render();
+  async fetchCommits() {
+    if (!this.didFetch) this.computeNodes();
+    const numMissing = this.missingNodes.size;
+    console.log('missing %d nodes', numMissing);
+    if (!numMissing) return;
+    const limit = this.didFetch ? 10 : 60;
+    const numNodes = this.nodesById.size;
+    try {
+      let toFetch = [...this.missingNodes.values()];
+      if (this.didFetch) {
+        toFetch.sort((a, b) => {
+          const yA = a.cy();
+          if (isNaN(yA)) return 1;
+          const yB = b.cy();
+          if (isNaN(yB)) return -1;
+          return a.cy() - b.cy();
         });
-
-        this.edges(edges);
-        this.nodes(nodes);
-        if (nodes.length > 0) {
-          this.graphHeight(nodes[nodes.length - 1].cy() + 80);
-        }
-        this.graphWidth(1000 + this.heighstBranchOrder * 90);
-      })
-      .catch((e) => this.server.unhandledRejection(e))
-      .finally(() => {
-        if (window.innerHeight - this.graphHeight() > 0 && nodeSize != this.nodes().length) {
-          this.scrolledToEnd();
-        }
+        const minY = window.screen.height + window.scrollY;
+        const pastVisibleIdx = toFetch.findIndex((n) => n.cy() > minY);
+        toFetch = toFetch.slice(0, Math.max(pastVisibleIdx - 1, 2));
+      }
+      const commits = await this.server.getPromise('/commits', {
+        path: this.repoPath(),
+        limit,
+        ids: toFetch.map((n) => n.sha1).join(),
       });
+      for (const c of commits) {
+        const node = this.getNode(c.sha1, c);
+        this.missingNodes.delete(node);
+      }
+      this.computeNodes();
+      if (!this.didFetch) {
+        this.didFetch = true;
+        // Make sure we load on-screen missing commits
+        await this.fetchCommits();
+      }
+    } catch (e) {
+      this.server.unhandledRejection(e);
+    } finally {
+      if (window.innerHeight - this.graphHeight() > 0 && numNodes != this.nodesById.size) {
+        this.scrolledToEnd();
+      }
+    }
   }
 
   traverseNodeLeftParents(node, callback) {
     callback(node);
-    const parent = this.nodesById[node.parents()[0]];
+    const parent = node.parents()[0];
     if (parent) {
       this.traverseNodeLeftParents(parent, callback);
     }
   }
 
-  computeNode(nodes) {
-    nodes = nodes || this.nodes();
-
-    this.markNodesIdeologicalBranches(this.refs(), nodes, this.nodesById);
-
-    const updateTimeStamp = moment().valueOf();
-    if (this.HEAD()) {
-      this.traverseNodeLeftParents(this.HEAD(), (node) => {
-        node.ancestorOfHEADTimeStamp = updateTimeStamp;
-      });
-    }
-
-    // Filter out nodes which doesn't have a branch (staging and orphaned nodes)
-    nodes = nodes.filter(
-      (node) =>
-        (node.ideologicalBranch() && !node.ideologicalBranch().isStash) ||
-        node.ancestorOfHEADTimeStamp == updateTimeStamp
-    );
-
-    let branchSlotCounter = this.HEAD() ? 1 : 0;
-
-    // Then iterate from the bottom to fix the orders of the branches
-    for (let i = nodes.length - 1; i >= 0; i--) {
-      const node = nodes[i];
-      if (node.ancestorOfHEADTimeStamp == updateTimeStamp) continue;
-      const ideologicalBranch = node.ideologicalBranch();
-
-      // First occurrence of the branch, find an empty slot for the branch
-      if (ideologicalBranch.lastSlottedTimeStamp != updateTimeStamp) {
-        ideologicalBranch.lastSlottedTimeStamp = updateTimeStamp;
-        ideologicalBranch.branchOrder = branchSlotCounter++;
+  /**
+   * Concept: put branches + side branches on slots
+   * - order the refs in some way
+   * - fully walk their nodes, marking ideological branches and slots
+   * - this leaves a couple branches
+   * - put each branch on the graph in a slot where they are clear for their entire length
+   */
+  computeNodes() {
+    // TODO only re-run if selected branches or gotten nodes changed
+    const startTs = Date.now();
+    /**
+     * Sorted collection of nodes
+     * Sort commits by descending date
+     * Note: output 0 means nodes are the same and are stored only once
+     *
+     * We use an array here, this is fast for 100-1000 nodes.
+     * For bigger graphs we should consider one of the strategies in js-sorted-set.
+     */
+    const comparator = (/** @type {GraphNode} */ a, /** @type {GraphNode} */ b) => {
+      if (a === b) return 0;
+      if (a.sha1 === b.sha1) {
+        console.log(a, b, 'are different but the same');
+        return 0;
       }
+      // parents always sort below, children always sort above
+      // note that we don't check transitively!
+      if (a.parents().includes(b)) return -1;
+      if (b.parents().includes(a)) return 1;
+      // Since we initialize order before inserting, this should never clash
+      const orderDiff = a.order - b.order;
+      // Make sure same-line commits are in walk order, ignoring date
+      if (a.line === b.line) return orderDiff;
+      // Otherwise order by descending date if known
+      if (a.date && b.date) {
+        const diff = b.date - a.date;
+        // don't return 0
+        if (diff) return diff;
+      }
+      return orderDiff;
+    };
+    /** @type {GraphNode[]} */
+    const nodes = [];
 
-      node.branchOrder(ideologicalBranch.branchOrder);
+    let maxSlot = 0;
+
+    // Get ordered set of refs to show
+    // perhaps make main branch always sort next to HEAD?
+    // or always give it the same color/style
+    const refs = this.refs()
+      // Pick the refs to show
+      // TODO allow dangling tags as roots
+      .filter((r) => !r.isLocalTag && !r.isRemoteTag && !r.isStash)
+      // Branch ordering
+      .sort((a, b) => {
+        if (a.isLocalHEAD) return -1;
+        if (b.isLocalHEAD) return 1;
+        if (a.isLocal && !b.isLocal) return -1;
+        if (b.isLocal && !a.isLocal) return 1;
+        if (a.isBranch && !b.isBranch) return -1;
+        if (b.isBranch && !a.isBranch) return 1;
+        if (a.isHEAD && !b.isHEAD) return 1;
+        if (!a.isHEAD && b.isHEAD) return -1;
+        if (a.node() === b.node()) return 0;
+        if (a.node().date && b.node().date) return b.node().date - a.node().date;
+        return 0;
+      });
+    if (!refs.length) return;
+
+    // Walk all nodes in straight lines, marking tops
+    let nodeCount = 0;
+    let lineCount = 0;
+    const seen = new WeakSet();
+    const tops = new WeakSet();
+    /** @type {{ node: GraphNode; ref: GraphRef }[]} */
+    const toWalk = [];
+    for (const ref of refs) {
+      const node = ref.node();
+      tops.add(node);
+      toWalk.push({ node, ref });
+    }
+    /** @type {{ start: GraphNode; stop: GraphNode }[]} */
+    const lines = [];
+    while (toWalk.length) {
+      // eslint-disable-next-line prefer-const
+      let { node, ref } = toWalk.shift();
+      if (seen.has(node)) continue;
+
+      // Walk the leftmost path to its end
+      // TODO push lines on array, figure out isRoot
+      lineCount++;
+      const start = node;
+      let stop = node;
+      do {
+        node.order = nodeCount++;
+        node.line = lineCount;
+        node.ideologicalBranch(ref);
+        seen.add(node);
+        if (!node.isInited()) this.missingNodes.add(node);
+        const parents = node.parents();
+        for (let i = parents.length - 1; i >= 0; i--) {
+          const p = parents[i];
+          tops.delete(p);
+          // Sort missing nodes immediately below last child
+          if (!p.isInited() && (!p.date || p.date >= node.date)) p.date = node.date - 1;
+          // Walk extra parents later
+          if (i) toWalk.unshift({ node: p, ref });
+        }
+        stop = node;
+        node = parents[0];
+      } while (node && !seen.has(node));
+      lines.push({ start, stop });
     }
 
-    this.heighstBranchOrder = branchSlotCounter - 1;
+    // Possibly we can move unconnected branches to the top or right
+    for (const { start, stop } of lines) {
+      // Find the next free slot by walking the nodes next to the line
+      // If one of the parents of a node is below the branch start,
+      // it counts as an occupied slot, so we start at 0.
+      // While walking, we insert the nodes in their right spot
+      // Afterwards, we set their slot.
+
+      // Give HEAD some room by slotting other branches from 2
+      const isHeadBranch = start.ideologicalBranch().isLocalHEAD;
+      let localMaxSlot = isHeadBranch ? -1 : 1;
+      let placed, prev;
+      let inserting = start;
+      let passedBranchTop = false;
+      const isConnected = !tops.has(start);
+
+      // // Special case: skip branches without loaded node, except HEAD
+      // if (!isConnected && !start.isInited() && !isHeadBranch) {
+      //   continue;
+      // }
+
+      let i = 0;
+      const insertNodesIfBefore = (placed, insertAll) => {
+        while (inserting && (insertAll || comparator(inserting, placed) < 0)) {
+          // TODO insert chunks in one go
+          nodes.splice(i - 1, 0, inserting);
+          i++;
+          if (inserting === stop) inserting = null;
+          else inserting = inserting.parents()[0];
+        }
+      };
+      while (i < nodes.length) {
+        placed = nodes[i++];
+        if (!passedBranchTop) {
+          if (isConnected ? placed.parents().includes(start) : comparator(start, placed) < 0) {
+            // We passed our branch head
+            // From now on, every node counts
+            passedBranchTop = true;
+            // Make room for the prev node tail
+            if (prev && prev.slot() > localMaxSlot) localMaxSlot = prev.slot();
+          } else if (!placed.parents().some((p) => comparator(start, p) < 0))
+            // This node doesn't influence maxSlot
+            continue;
+        }
+        const slot = placed.slot();
+        if (slot > localMaxSlot) localMaxSlot = slot;
+        if (passedBranchTop) insertNodesIfBefore(placed);
+        // Did we pass our last node?
+        if (comparator(stop, placed) < 0) {
+          insertNodesIfBefore(placed, true);
+          break;
+        }
+        prev = placed;
+      }
+      while (inserting) {
+        nodes.push(inserting);
+        if (inserting === stop) break;
+        else inserting = inserting.parents()[0];
+      }
+      localMaxSlot++;
+      if (maxSlot < localMaxSlot) maxSlot = localMaxSlot;
+      // Now place the line of commits
+      let node = start;
+      do {
+        node.slot(localMaxSlot);
+        if (node === stop) break;
+        node = node.parents()[0];
+      } while (node);
+    }
+
+    /** @type {GraphNode} */
     let prevNode;
-    nodes.forEach((node) => {
-      node.ancestorOfHEAD(node.ancestorOfHEADTimeStamp == updateTimeStamp);
-      if (node.ancestorOfHEAD()) node.branchOrder(0);
+    let maxY = 0;
+    for (const node of nodes) {
+      // Maybe it's better to store the index, to consider later
       node.aboveNode = prevNode;
       if (prevNode) prevNode.belowNode = node;
+      node.render();
+      if (maxY < node.cy()) maxY = node.cy();
       prevNode = node;
-    });
+    }
+    if (prevNode) prevNode.belowNode = null;
 
-    return nodes;
+    const edges = [];
+    for (const node of nodes) {
+      for (const parent of node.parents()) {
+        edges.push(this.getEdge(node.sha1, parent.sha1));
+      }
+    }
+
+    const calcTs = Date.now();
+    this.edges(edges);
+    this.nodes(nodes);
+
+    this.graphHeight(maxY + 80);
+    this.graphWidth(1000 + maxSlot * 90);
+    const layoutTs = Date.now();
+    console.log(
+      `computeNodes: ${nodes.length} nodes, calc ${calcTs - startTs}ms, layout ${
+        layoutTs - startTs
+      }ms`
+    );
   }
 
   getEdge(nodeAsha1, nodeBsha1) {
@@ -217,43 +378,6 @@ class GraphViewModel {
       edge = this.edgesById[id] = new EdgeViewModel(this, nodeAsha1, nodeBsha1);
     }
     return edge;
-  }
-
-  markNodesIdeologicalBranches(refs, nodes, nodesById) {
-    refs = refs.filter((r) => !!r.node());
-    refs = refs.sort((a, b) => {
-      if (a.isLocal && !b.isLocal) return -1;
-      if (b.isLocal && !a.isLocal) return 1;
-      if (a.isBranch && !b.isBranch) return -1;
-      if (b.isBranch && !a.isBranch) return 1;
-      if (a.isHEAD && !b.isHEAD) return 1;
-      if (!a.isHEAD && b.isHEAD) return -1;
-      if (a.isStash && !b.isStash) return 1;
-      if (b.isStash && !a.isStash) return -1;
-      if (a.node() && a.node().date && b.node() && b.node().date)
-        return a.node().date - b.node().date;
-      return a.refName < b.refName ? -1 : 1;
-    });
-    const stamp = this._markIdeologicalStamp++;
-    refs.forEach((ref) => {
-      this.traverseNodeParents(ref.node(), (node) => {
-        if (node.stamp == stamp) return false;
-        node.stamp = stamp;
-        node.ideologicalBranch(ref);
-        return true;
-      });
-    });
-  }
-
-  traverseNodeParents(node, callback) {
-    if (!callback(node)) return false;
-    for (let i = 0; i < node.parents().length; i++) {
-      // if parent, travers parent
-      const parent = this.nodesById[node.parents()[i]];
-      if (parent) {
-        this.traverseNodeParents(parent, callback);
-      }
-    }
   }
 
   handleBubbledClick(elem, event) {
@@ -274,10 +398,8 @@ class GraphViewModel {
 
   onProgramEvent(event) {
     if (event.event == 'git-directory-changed') {
-      this.loadNodesFromApiThrottled();
       this.updateBranchesThrottled();
-    } else if (event.event == 'request-app-content-refresh') {
-      this.loadNodesFromApiThrottled();
+      // } else if (event.event == 'request-app-content-refresh') {
     } else if (event.event == 'remote-tags-update') {
       this.setRemoteTags(event.tags);
     } else if (event.event == 'current-remote-changed') {
@@ -307,7 +429,7 @@ class GraphViewModel {
   }
 
   setRemoteTags(remoteTags) {
-    const version = Date.now();
+    const stamp = Date.now();
 
     const sha1Map = {}; // map holding true sha1 per tags
     remoteTags.forEach((tag) => {
@@ -324,13 +446,13 @@ class GraphViewModel {
     remoteTags.forEach((ref) => {
       if (!ref.name.includes('^{}')) {
         const name = `remote-tag: ${ref.remote}/${ref.name.split('/')[2]}`;
-        this.getRef(name).node(this.getNode(sha1Map[ref.name]));
-        this.getRef(name).version = version;
+        const r = this.getRef(name, sha1Map[ref.name]);
+        r.stamp = stamp;
       }
     });
     this.refs().forEach((ref) => {
       // tag is removed from another source
-      if (ref.isRemoteTag && (!ref.version || ref.version < version)) {
+      if (ref.isRemoteTag && ref.stamp !== stamp) {
         ref.remove(true);
       }
     });
@@ -338,7 +460,9 @@ class GraphViewModel {
 
   checkHeadMove(toNode) {
     if (this.HEAD() === toNode) {
-      this.HEADref.node(toNode);
+      this.HEADref().node(toNode);
     }
   }
 }
+
+module.exports = GraphViewModel;

@@ -121,7 +121,7 @@ class Reset extends ActionBase {
         if (!diag.result()) return;
         return this.server
           .postPromise('/reset', { path: this.graph.repoPath(), to: remoteRef.name, mode: 'hard' })
-          .then(() => {
+          .then((sha1) => {
             context.node(remoteRef.node());
           });
       }).closePromise;
@@ -166,7 +166,7 @@ class Merge extends ActionBase {
     this.node = node;
     this.visible = ko.computed(() => {
       if (this.isRunning()) return true;
-      if (!this.graph.checkedOutRef() || !this.graph.checkedOutRef().node()) return false;
+      if (!this.graph.checkedOutRef()) return false;
       return (
         this.graph.currentActionContext() instanceof RefViewModel &&
         !this.graph.currentActionContext().current() &&
@@ -221,13 +221,13 @@ class Push extends ActionBase {
     const remoteRef = ref.getRemoteRef(this.graph.currentRemote());
 
     if (remoteRef) {
-      return remoteRef.moveTo(ref.node().sha1);
+      return remoteRef.moveTo(ref.sha1);
     } else {
       return ref
         .createRemoteRef()
         .then(() => {
           if (this.graph.HEAD().name == ref.name) {
-            this.grah.HEADref().node(ref.node());
+            this.graph.HEADref().node(ref.node());
           }
         })
         .finally(() => programEvents.dispatch({ event: 'request-fetch-tags' }));
@@ -319,13 +319,9 @@ class Uncommit extends ActionBase {
   perform() {
     return this.server
       .postPromise('/reset', { path: this.graph.repoPath(), to: 'HEAD^', mode: 'mixed' })
-      .then(() => {
-        let targetNode = this.node.belowNode;
-        while (targetNode && !targetNode.ancestorOfHEAD()) {
-          targetNode = targetNode.belowNode;
-        }
-        this.graph.HEADref().node(targetNode ? targetNode : null);
-        this.graph.checkedOutRef().node(targetNode ? targetNode : null);
+      .then((sha1) => {
+        this.graph.getRef('HEAD', sha1);
+        if (this.graph.checkedOutRef()) this.graph.checkedOutRef().setSha1(sha1);
       });
   }
 }

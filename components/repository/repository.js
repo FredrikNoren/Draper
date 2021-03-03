@@ -30,7 +30,6 @@ class RepositoryViewModel {
       this.server.watchRepository(value);
     });
     this.server.watchRepository(this.repoPath());
-    this.showLog = this.isBareDir ? ko.observable(true) : this.staging.isStageValid;
     this.parentModulePath = ko.observable();
     this.parentModuleLink = ko.observable();
     this.isSubmodule = ko.computed(() => this.parentModulePath() && this.parentModuleLink());
@@ -73,14 +72,12 @@ class RepositoryViewModel {
           return this.server
             .getPromise('/submodules', { path: baseRepoPath.path })
             .then((submodules) => {
-              if (Array.isArray(submodules)) {
-                const baseName = this.repoPath().substring(baseRepoPath.path.length + 1);
-                for (let n = 0; n < submodules.length; n++) {
-                  if (submodules[n].path === baseName) {
-                    this.parentModulePath(baseRepoPath.path);
-                    this.parentModuleLink(`/#/repository?path=${encodePath(baseRepoPath.path)}`);
-                    return;
-                  }
+              const baseName = this.repoPath().substring(baseRepoPath.path.length + 1);
+              for (let n = 0; n < submodules.length; n++) {
+                if (submodules[n].path === baseName) {
+                  this.parentModulePath(baseRepoPath.path);
+                  this.parentModuleLink(`/#/repository?path=${encodePath(baseRepoPath.path)}`);
+                  return;
                 }
               }
             });

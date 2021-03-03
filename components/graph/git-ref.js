@@ -6,11 +6,13 @@ const components = require('ungit-components');
 const Selectable = require('./selectable');
 
 class RefViewModel extends Selectable {
-  constructor(fullRefName, graph) {
+  constructor(fullRefName, /** @type {GitGraph} */ graph, /** @type {Hash} */ sha1) {
     super(graph);
     this.graph = graph;
+    this.sha1 = sha1;
     this.name = fullRefName;
-    this.node = ko.observable();
+    this.stamp = null; // setRemoteTags()
+    this.node = ko.observable(/** @type {GraphNode} */ (null));
     this.localRefName = this.name; // origin/master or master
     this.refName = this.name; // master
     this.isRemoteTag = this.name.indexOf('remote-tag: ') == 0;
@@ -64,6 +66,7 @@ class RefViewModel extends Selectable {
     this.node.subscribe((newNode) => {
       if (newNode) newNode.pushRef(this);
     });
+    this.node(graph.getNode(sha1));
 
     // This optimization is for autocomplete display
     this.value = splitedName[splitedName.length - 1];
@@ -84,6 +87,15 @@ class RefViewModel extends Selectable {
     };
   }
 
+  displayHtml() {
+    return '';
+  }
+
+  setSha1(sha1) {
+    this.sha1 = sha1;
+    this.node(this.graph.getNode(sha1));
+  }
+
   _colorFromHashOfString(string) {
     return `#${md5(string).toString().slice(0, 6)}`;
   }
@@ -91,6 +103,7 @@ class RefViewModel extends Selectable {
   dragStart() {
     this.graph.currentActionContext(this);
     this.isDragging(true);
+    // @ts-ignore
     if (document.activeElement) document.activeElement.blur();
   }
 
@@ -102,7 +115,7 @@ class RefViewModel extends Selectable {
   moveTo(target, rewindWarnOverride) {
     let promise;
     if (this.isLocal) {
-      const toNode = this.graph.nodesById[target];
+      const toNode = this.graph.nodesById.get(target);
       const args = {
         path: this.graph.repoPath(),
         name: this.refName,
@@ -268,8 +281,8 @@ class RefViewModel extends Selectable {
           });
         }
       })
-      .then(() => {
-        this.graph.HEADref().node(this.node());
+      .then((sha1) => {
+        this.graph.getRef('HEAD', sha1);
       })
       .catch((err) => {
         if (err.errorCode != 'merge-failed') this.server.unhandledRejection(err);

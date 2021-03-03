@@ -25,9 +25,10 @@ class RemotesViewModel {
     this.fetchEnabled = ko.computed(() => this.remotes().length > 0);
 
     this.shouldAutoFetch = ungit.config.autoFetch;
-    this.updateRemotes();
+    // don't block initial load
+    setTimeout(() => this.updateRemotes(), 200);
     this.isFetching = false;
-    this.fetchDebounced = _.debounce(() => this.fetch({ tags: true }), 500);
+    this.fetchDebounced = _.throttle(() => this.fetch({ tags: true }), 500);
   }
 
   updateNode(parentElement) {
